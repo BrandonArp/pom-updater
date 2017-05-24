@@ -1,0 +1,24 @@
+#!/bin/bash
+
+for r in `./org_repos.rb`; do
+
+  pushd $r > /dev/null 2>&1
+
+  rev=$(git rev-parse --abbrev-ref HEAD)
+  if [ "${rev}" != "master" ]; then
+    echo "${r} DIRTY - Not on master branch"
+  else
+    out=$(git diff-index --quiet HEAD --)
+    modified=$?
+    if [ "${modified}" -ne "0" ]; then
+      echo "${r} DIRTY - Modified"
+    else
+      # check for committed, but not pushed
+      out=$(git rev-list HEAD@{upstream}..HEAD | wc -l)
+      if [ "${out}" -ne "0" ]; then
+	echo "${r} DIRTY - Unpushed"
+      fi
+    fi
+  fi
+  popd > /dev/null 2>&1
+done
