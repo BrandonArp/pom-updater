@@ -6,6 +6,7 @@ require 'uri'
 require 'nokogiri'
 require 'pp'
 require 'open-uri'
+require 'set'
 
 def get_response(url)
   uri = URI.parse(url)
@@ -21,10 +22,12 @@ class Project
   attr_accessor :gav
   attr_accessor :latest_version
   attr_accessor :up_to_date
+  attr_accessor :reverse_dependencies
 
   def initialize(directory, gav)
     @directory = directory
     @dependencies = []
+    @reverse_dependencies = []
     @gav = gav
     @latest_version = nil
     @up_to_date = false
@@ -57,6 +60,10 @@ class GAV
   def dot_to_slash(str)
     str.gsub('.', '/')
   end
+
+  def to_s
+    version_string
+  end
 end
 
 if ARGV.length == 0
@@ -67,47 +74,99 @@ workspace = ARGV[0]
 
 dependency_index = {}
 projects = {}
+group_whitelist = Set.new(['com.arpnetworking'])
 
 print "Looking for repos..."
 entries = Dir.entries(workspace)
+poms = []
 for entry in entries do
   if Dir.exists?(entry)
     Dir.chdir("#{workspace}/#{entry}") do
       if Dir.exist?(".git") and File.exist?("pom.xml")
-        #puts "found git repo with maven project #{entry}" 
+        poms << File.expand_path("pom.xml")
 
-        pom_body = IO.read("pom.xml")
-        pom = Nokogiri::XML(pom_body).remove_namespaces!
-        group_id = pom.xpath("/project/groupId").first.text
-        artifact_id = pom.xpath("/project/artifactId").first.text
-        version = pom.xpath("/project/version").first.text
-        properties_nodes = pom.xpath("/project/properties/*")
-        properties = {}
-        properties_nodes.each { |node|
-          properties[node.name] = node.text
-        }
-        dependencies = pom.xpath("/project/dependencies//dependency")
-        pom_gav = GAV.new(group_id, artifact_id, version)
-        project = Project.new("#{workspace}/#{entry}", pom_gav)
-        projects[pom_gav.artifact_string] = project
-        
-        dependencies.each { |dep|
-          dep_group_id = dep.xpath("groupId").first.text
-          dep_artifact_id = dep.xpath("artifactId").first.text
-          dep_version = dep.xpath("version").first.text
-          if dep_version[0] == "$" and dep_version[1] == "{" and dep_version[-1] == "}"
-            dep_version = properties[dep_version[2..-2]]
-          end
-
-          dep_obj = GAV.new(dep_group_id, dep_artifact_id, dep_version)
-
-          project.dependencies << dep_obj
-          #pp dep_artifact_version
-        }
       end
     end
   end
 end
+
+while poms.size > 0 do
+  file = poms.shift
+  pom_body = IO.read(file)
+  pom = Nokogiri::XML(pom_body).remove_namespaces!
+  artifact_id = pom.xpath("/project/artifactId").first.text
+  group_id = nil
+  if pom.xpath("/project/parent").first
+    parent_group = pom.xpath("/project/parent/groupId").first.text
+    parent_artifact = pom.xpath("/project/parent/artifactId").first.text
+    parent_version = pom.xpath("/project/parent/version").first.text
+    parent_gav = GAV.new(parent_group, parent_artifact, parent_version)
+  end
+  if pom.xpath("/project/groupId").first
+    group_id = pom.xpath("/project/groupId").first.text
+  else
+    group_id = parent_gav.group_id
+  end
+  version = nil
+  if pom.xpath("/project/version").first
+    version = pom.xpath("/project/version").first.text
+  else
+    version = parent_gav.version
+  end
+  properties_nodes = pom.xpath("/project/properties/*")
+  properties = {}
+  properties_nodes.each { |node|
+    properties[node.name] = node.text
+  }
+
+  modules = pom.xpath("/project/modules//module").each { |mod|
+    poms << File.dirname(file).concat("/#{mod.text}/pom.xml")
+  }
+
+  dependencies = pom.xpath("/project/dependencies//dependency")
+  pom.xpath("/project/dependencyManagement//dependency").each { |node| dependencies.push(node)}
+
+  pom_gav = GAV.new(group_id, artifact_id, version)
+  project = Project.new("#{workspace}/#{entry}", pom_gav)
+  projects[pom_gav.artifact_string] = project
+
+  dependencies.each { |dep|
+    dep_group_id = dep.xpath("groupId").first.text
+
+    include = false
+    dep_group_id_parts = dep_group_id.split('.')
+    for x in 0..dep_group_id_parts.size - 1
+      next unless group_whitelist.include? dep_group_id_parts.slice(0, x).join('.')
+      include = true
+    end
+
+    next unless include
+
+    dep_version = nil
+    dep_artifact_id = dep.xpath("artifactId").first.text
+    if dep.xpath("version").first
+      dep_version = dep.xpath("version").first.text
+    else
+      dep_version = projects[parent_gav.artifact_string].dependencies.select { |d| d.group_id == dep_group_id && d.artifact_id == dep_artifact_id }.first.version
+    end
+    if dep_version[0] == "$" and dep_version[1] == "{" and dep_version[-1] == "}"
+      dep_version = properties[dep_version[2..-2]]
+    end
+
+    dep_obj = GAV.new(dep_group_id, dep_artifact_id, dep_version)
+
+    project.dependencies << dep_obj
+  }
+
+end
+
+projects.each {|k, v|
+  v.dependencies.each{|dep|
+    puts "ERROR, could not find project #{dep.artifact_string} in projects" if projects[dep.artifact_string] == nil
+    projects[dep.artifact_string].reverse_dependencies << v
+  }
+  # puts "k, v: #{k} ====>>>  #{v.dependencies}"
+}
 puts " done."
 print "Looking up latest versions in central..."
 
