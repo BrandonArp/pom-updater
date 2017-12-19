@@ -132,6 +132,7 @@ while poms.size > 0 do
 
   dependencies.each { |dep|
     dep_group_id = dep.xpath("groupId").first.text
+    dep_artifact_id = dep.xpath("artifactId").first.text
 
     include = false
     dep_group_id_parts = dep_group_id.split('.')
@@ -140,16 +141,21 @@ while poms.size > 0 do
       include = true
     end
 
+    if dep_artifact_id == parent_gav.artifact_id && dep_group_id == parent_gav.group_id
+      include = false
+    end
+
     next unless include
 
     dep_version = nil
-    dep_artifact_id = dep.xpath("artifactId").first.text
     if dep.xpath("version").first
       dep_version = dep.xpath("version").first.text
     else
       dep_version = projects[parent_gav.artifact_string].dependencies.select { |d| d.group_id == dep_group_id && d.artifact_id == dep_artifact_id }.first.version
     end
-    if dep_version[0] == "$" and dep_version[1] == "{" and dep_version[-1] == "}"
+    if dep_version == "${project.version}"
+      next
+    elsif dep_version[0] == "$" and dep_version[1] == "{" and dep_version[-1] == "}"
       dep_version = properties[dep_version[2..-2]]
     end
 
@@ -160,38 +166,93 @@ while poms.size > 0 do
 
 end
 
+#Compute the reverse dependencies
 projects.each {|k, v|
   v.dependencies.each{|dep|
     puts "ERROR, could not find project #{dep.artifact_string} in projects" if projects[dep.artifact_string] == nil
-    projects[dep.artifact_string].reverse_dependencies << v
+    projects[dep.artifact_string].reverse_dependencies << v.gav
   }
   # puts "k, v: #{k} ====>>>  #{v.dependencies}"
 }
 puts " done."
-print "Looking up latest versions in central..."
 
-#filter the dependencies to just the workspace projects
-for artifact,project in projects do
-  project.dependencies.reject! { |d| projects[d.artifact_string].nil? }
+latest_versions = {}
+def require_update?(gav, latest_versions)
+  latest = latest_versions[gav.artifact_string]
 
-  project.dependencies.each { |d| 
-    arr = dependency_index[d.artifact_string()] || []
-    arr << project
-    dependency_index[d.artifact_string()] = arr
-  }
-
-  begin
-    url = "#{project.gav.central_location_artifact}/maven-metadata.xml"
-    versions = Nokogiri::XML(open(url)).remove_namespaces!
-    latest = versions.xpath("/metadata/versioning/latest").first.text
-    project.latest_version = latest
-  rescue OpenURI::HTTPError => e
-    next if e.io.status[0] == "404" 
-    pp e
+  if latest.nil?
+    begin
+      url = "#{gav.central_location_artifact}/maven-metadata.xml"
+      versions = Nokogiri::XML(open(url)).remove_namespaces!
+      latest = versions.xpath("/metadata/versioning/latest").first.text
+      latest_versions[gav.artifact_string] = latest
+    rescue OpenURI::HTTPError => e
+      pp e
+      return false if e.io.status[0] == "404"
+    end
   end
+  latest != gav.version
+end
+#Find the roots (projects with no deps) and mark them as up to date
+up_to_date = projects.select { |key, project| project.dependencies.size == 0 }
+# puts "Up to date:"
+# up_to_date.each { |key, project| puts project.gav }
+remaining = projects.dup
+remaining.delete_if { |key, project| up_to_date.include?(key)}
+#Lookup the projects that only depend on the up to date projects
+modified = true
+while modified do
+  modified = false
+  next_batch = remaining.select{ |key, project| project.dependencies.all? { |dep| up_to_date.include?(dep.artifact_string)}}
+  # puts "next batch: "
+  next_batch.each { |key, project|
+    remaining.delete(project.gav.artifact_string)
+    needs_update = project.dependencies.select { |dep| require_update?(dep, latest_versions) }
+    if needs_update.size > 0
+      puts "In #{project.gav.artifact_string}"
+      needs_update.each {|dep|
+        puts "   #{dep} needs update to #{latest_versions[dep.artifact_string]}"
+      }
+    else
+      modified = true
+      up_to_date[key] = project
+    end
+
+  }
+  # if next_batch.size > 0
+  #   remaining.delete_if { |key, project| next_batch.include?(key)}
+  #   up_to_date.merge!(next_batch)
+  #   modified = true
+  # end
+  # Look at the versions of the deps for next batch.  If the versions are the latest in maven, they're up to date
 end
 
-puts " done."
+puts "Further updates required:"
+remaining.each { |key, project| puts key}
+# print "Looking up latest versions in central..."
+#
+#filter the dependencies to just the workspace projects
+# for artifact,project in projects do
+#   project.dependencies.reject! { |d| projects[d.artifact_string].nil? }
+#
+#   project.dependencies.each { |d|
+#     arr = dependency_index[d.artifact_string] || []
+#     arr << project
+#     dependency_index[d.artifact_string] = arr
+#   }
+#
+#   begin
+#     url = "#{project.gav.central_location_artifact}/maven-metadata.xml"
+#     versions = Nokogiri::XML(open(url)).remove_namespaces!
+#     latest = versions.xpath("/metadata/versioning/latest").first.text
+#     project.latest_version = latest
+#   rescue OpenURI::HTTPError => e
+#     next if e.io.status[0] == "404"
+#     pp e
+#   end
+# end
+#
+# puts " done."
 
 #pp projects
 
